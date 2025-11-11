@@ -1,7 +1,10 @@
-- name: Deploy Caddy Web Server
+- name: Deploy caddy
   gather_facts: false
   hosts: all
   become: true
+  vars:
+    email: example@example.com
+    fqdn: server.example.com
 
   tasks:
     - name: Install Firewalld
@@ -38,7 +41,6 @@
         force: true
         content: |
           {
-            admin off
             local_certs
             skip_install_trust
             auto_https disable_redirects 
@@ -49,6 +51,35 @@
               protocols h3
             }
           }
+          (botfilter) {
+            handle {
+              @private {
+                remote_ip private_ranges
+              }
+              @danger {
+                dynamic_client_ip list {
+                  url https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/datacenter/ipv4.txt
+                  url https://raw.githubusercontent.com/X4BNet/lists_torexit/refs/heads/main/ipv4.txt
+                  interval 12h
+                  timeout 300s
+                  retries 3
+                }
+              }
+              @bad-bot {
+                header CF-Worker *
+                crawler
+              }
+              vars bot_barrier_complexity 14
+              vars @private bot_barrier_complexity 12
+              vars @danger bot_barrier_complexity 18
+              vars @bad-bot bot_barrier_complexity 22
+
+              bot_barrier {
+                complexity {vars.bot_barrier_complexity}
+                valid_for 15m
+              }
+            }
+          }
 
           http:// {
             bind fd/3 {
@@ -56,15 +87,19 @@
             }
             redir https://{host}{uri}
           }
- 
+          https://{{fqdn}} {
+            import botfilter
+            respond "Ok!"
+          }
+
           import sites/*
-    - name: Create network file
+    - name: Create caddy network file
       ansible.builtin.copy:
         dest: /etc/containers/systemd/caddy.network
         content: |
           [Network]
-          Subnet=100.80.0.0/24
-          Gateway=100.80.0.1
+          Subnet=10.80.0.0/24
+          Gateway=10.80.0.1
     - name: Create socket file
       ansible.builtin.copy:
         dest: /etc/systemd/system/caddy.socket
@@ -95,14 +130,39 @@
         dest: /etc/containers/systemd/caddy_config.volume
         content: |
           [Volume]
-    - name: Create container file
+    - name: Create caddy-build script
+      ansible.builtin.copy:
+        dest: /root/xcaddy-Containerfile
+        content: |
+          FROM docker.io/caddy:2-builder AS builder
+
+          RUN --mount=type=cache,target=/go/pkg/mod \
+          --mount=type=cache,target=/root/.cache/go-build \
+          xcaddy build \
+          --with github.com/steffenbusch/caddy-bot-barrier \
+          --with github.com/tuzzmaniandevil/caddy-dynamic-clientip \
+          --with git.gorbe.io/caddy/crawler \
+          --with github.com/monobilisim/caddy-ip-list
+
+          FROM docker.io/caddy:2
+
+          COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+
+    - name: Create caddy container build file
+      ansible.builtin.copy:
+        dest: /etc/containers/systemd/caddy.build
+        content: |
+          [Build]
+          ImageTag=localhost/caddy:latest
+          File=/root/xcaddy-Containerfile
+          Pull=newer
+    - name: Create caddy container file
       ansible.builtin.copy:
         dest: /etc/containers/systemd/caddy.container
         content: |
           [Container]
-          Image=docker.io/caddy
-          Pull=always
-          AutoUpdate=registry
+          Image=caddy.build
+          AutoUpdate=local
           Network=caddy.network
           NetworkAlias=caddy
           Volume=/etc/caddy:/etc/caddy
@@ -111,7 +171,7 @@
           Notify=true
 
           [Service]
-          Restart=always
+          Restart=unless-stopped
           TimeoutStartSec=900
 
           [Install]
@@ -128,4 +188,3 @@
       ansible.builtin.systemd_service:
         name: caddy.service
         state: restarted
-
